@@ -162,6 +162,49 @@ function updateJobStats(jobId) {
   };
 }
 
+async function processVideoChunk(chunk, jobId, channelId) {
+  // Process all videos in the chunk in parallel
+  const chunkPromises = chunk.map(async (videoBasicInfo) => {
+    try {
+      // Fetch full details for this video (comments, captions, etc.)
+      const videoDetails = await fetchVideoDetails(videoBasicInfo);
+
+      // Send this video to the queue
+      await sendToQueue(QUEUES.VIDEO_ANALYSIS, {
+        jobId,
+        channelId,
+        video: videoDetails,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Initialize the video status
+      jobData[jobId].videos[videoDetails.id] = {
+        status: "queued",
+        title: videoDetails.title,
+        timestamp: new Date().toISOString(),
+      };
+
+      return { success: true, video: videoDetails };
+    } catch (error) {
+      console.error(`Error processing video ${videoBasicInfo.id}:`, error);
+
+      // Mark this video as failed
+      jobData[jobId].videos[videoBasicInfo.id] = {
+        status: "failed",
+        title: videoBasicInfo.title,
+        error: error.message,
+        timestamp: new Date().toISOString(),
+      };
+
+      jobData[jobId].failedVideos++;
+      return { success: false, video: videoBasicInfo };
+    }
+  });
+
+  // Wait for all videos in the chunk to complete processing
+  return await Promise.all(chunkPromises);
+}
+
 // Routes
 app.get("/", (req, res) => {
   res.sendFile(join(__dirname, "public", "index.html"));
@@ -219,51 +262,25 @@ app.post("/analyze", async (req, res) => {
     // Send response to client immediately, but continue processing
     res.json(response);
 
-    // Process each video one by one (after sending response)
-    console.log(`Starting to process ${videoBasicInfoList.length} videos one by one...`);
+    // Process videos in chunks of 3
+    const CHUNK_SIZE = 3;
+    console.log(
+      `Starting to process ${videoBasicInfoList.length} videos in chunks of ${CHUNK_SIZE} (processing each chunk in parallel)...`
+    );
 
-    // Use a for loop instead of Promise.all to process in sequence
-    for (let i = 0; i < videoBasicInfoList.length; i++) {
-      const videoBasicInfo = videoBasicInfoList[i];
+    // Update job status
+    jobData[jobId].status = "processing";
 
-      try {
-        // Update job status
-        jobData[jobId].status = "processing";
+    // Process videos in chunks
+    for (let i = 0; i < videoBasicInfoList.length; i += CHUNK_SIZE) {
+      const chunk = videoBasicInfoList.slice(i, i + CHUNK_SIZE);
+      const chunkResults = await processVideoChunk(chunk, jobId, channelId);
 
-        // Fetch full details for this video (comments, captions, etc.)
-        const videoDetails = await fetchVideoDetails(videoBasicInfo);
-
-        // Send this video to the queue
-        await sendToQueue(QUEUES.VIDEO_ANALYSIS, {
-          jobId,
-          channelId,
-          video: videoDetails,
-          timestamp: new Date().toISOString(),
-        });
-
-        console.log(
-          `Sent video ${i + 1}/${videoBasicInfoList.length} to queue: ${videoDetails.title}`
-        );
-
-        // Initialize the video status
-        jobData[jobId].videos[videoDetails.id] = {
-          status: "queued",
-          title: videoDetails.title,
-          timestamp: new Date().toISOString(),
-        };
-      } catch (error) {
-        console.error(`Error processing video ${videoBasicInfo.id}:`, error);
-
-        // Mark this video as failed
-        jobData[jobId].videos[videoBasicInfo.id] = {
-          status: "failed",
-          title: videoBasicInfo.title,
-          error: error.message,
-          timestamp: new Date().toISOString(),
-        };
-
-        jobData[jobId].failedVideos++;
-      }
+      console.log(
+        `Processed chunk ${Math.floor(i / CHUNK_SIZE) + 1}/${Math.ceil(
+          videoBasicInfoList.length / CHUNK_SIZE
+        )} (${chunkResults.length} videos)`
+      );
     }
 
     // Update job status after all videos have been queued
